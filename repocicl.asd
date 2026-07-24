@@ -1,6 +1,6 @@
-(defsystem "lamb.files.payload"
-  :description "file hash compres and send utility"
-  :author "common-lamb (https://github.com/common-lamb)"
+(defsystem "metarepl.systems.repocicl"
+  :description "ocicl for repositories"
+  :author "metarepl (https://github.com/metarepl)"
   :version "0.0.1"
   :license "MIT"
   :depends-on (
@@ -16,4 +16,7 @@
                )
   :serial t
   :components ((:file "package")
-               (:file "payload")))
+               (:module "src"
+                :components ((:file "repocicl")))
+               (:module "test"
+                :components ((:file "test")))))

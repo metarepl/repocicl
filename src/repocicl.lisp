@@ -1,4 +1,4 @@
-(in-package :reposicle)
+(in-package :repocicl)
 
 (defvar *search-addresses* nil)
 (defvar *cloned-list* nil)   ; list of URLs to ensure-cloned

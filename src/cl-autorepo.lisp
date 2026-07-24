@@ -1,5 +1,3 @@
-(in-package :cl-autorepo)
-
 ;;;
 ;;; cl-autorepo
 ;;; Automatically download repositories, and make them
