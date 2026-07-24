@@ -138,7 +138,8 @@
 
 (defun warn-if-program-doesnt-exist (program-name)
   "If VERBOSE, print a warning if PROGRAM-NAME doesn't exist or isn't executable."
-  (when (and (should-log) (not (program-exists-p program-name)))
+  (when (and (should-log)
+             (not (program-exists-p program-name)))
     (format *verbose* "~&; ***************************************************************~%")
     (format *verbose* "; WARNING: `~A` could not be found!~%" program-name)
     (format *verbose* "; ***************************************************************~%")

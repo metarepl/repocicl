@@ -1,26 +1,26 @@
-;;;
-;;; cl-autorepo
-;;; Automatically download repositories, and make them
-;;; known to ASDF
-;;;
 
-;; ASDF looks here by default
-(defparameter *repo-dir*
-  (merge-pathnames ".local/share/common-lisp/source/" (user-homedir-pathname)))
+(defparameter *repocicl-dir*
+  (merge-pathnames "repocicl/" (user-homedir-pathname)))
 
-(defun add-system (name url &optional (repository-type :git))
-  "Download the system named NAME of REPOSITORY-TYPE
-from the URL, unless it's already defined."
-  (or (asdf:find-system name nil)
-      (let ((path (merge-pathnames
-                   (make-pathname :directory `(:relative ,name)
-                                  :name name
-                                  :type "asd")
-                   *repo-dir*)))
-        (unless (ignore-errors (load path))
+(defun add-system (asdf-system url &optional (repository-type :git) (repocicl-dir *repocicl-dir*))
+  "Download the ASDF-SYSTEM of REPOSITORY-TYPE from the URL
+ unless it's already defined."
+  (if (asdf:find-system asdf-system nil)
+      ;; no download needed
+      (asdf:load-system asdf-system)
+      ;; download needed
+      (progn
+        (let ((asdf-system-path (merge-pathnames
+                                 (make-pathname :directory `(:relative ,asdf-system)
+                                                :name asdf-system
+                                                :type "asd")
+                                 repocicl-dir)))
+          ;; download
           (download-repo repository-type url *repo-dir*)
-          (load path))
-        (asdf:find-system name))))
+          ;; and load
+          (asdf:find-system asdf-system)
+          (asdf:load-system asdf-system)
+          ))))
 
 (defgeneric download-repo (repository-type url directory)
   (:documentation "Download a repository of REPOSITORY-TYPE from URL, as a
@@ -28,7 +28,9 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
 (defun download-repo-helper (program-args directory url)
   (uiop:run-program `(,@program-args ,url)
-                    :directory directory :output :interactive :error-output :interactive))
+                    :directory directory
+                    :output :interactive
+                    :error-output :interactive))
 
 (defmethod download-repo ((repository-type (eql :git)) url directory)
   (download-repo-helper '("git" "clone") directory url))
@@ -41,22 +43,3 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
 (defmethod download-repo ((repository-type (eql :hg)) url directory)
   (download-repo-helper '("hg" "clone") directory url))
-
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;
-;;; Copyright 2011 Bill St. Clair
-;;;
-;;; Licensed under the Apache License, Version 2.0 (the "License");
-;;; you may not use this file except in compliance with the License.
-;;; You may obtain a copy of the License at
-;;;
-;;;     http://www.apache.org/licenses/LICENSE-2.0
-;;;
-;;; Unless required by applicable law or agreed to in writing, software
-;;; distributed under the License is distributed on an "AS IS" BASIS,
-;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-;;; See the License for the specific language governing permissions
-;;; and limitations under the License.
-;;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

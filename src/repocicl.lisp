@@ -1,24 +1,24 @@
 (in-package :repocicl)
 
-(defvar *search-addresses* nil)
 (defvar *cloned-list* nil)   ; list of URLs to ensure-cloned
 (defvar *updated-list* nil)  ; list of URLs (or (url :ref "xxx")) to ensure-updated
+(defvar *search-addresses* nil) ; list of github urls to search for systems below
 
-(defvar *offline-mode* (uiop:getenv "REPOSICLE_OFFLINE"))
-(defvar *github-token* (uiop:getenv "REPOSICLE_GITHUB_TOKEN"))
+(defvar *offline-mode* (uiop:getenv "REPOCICL_OFFLINE"))
+(defvar *github-token* (uiop:getenv "REPOCICL_GITHUB_TOKEN"))
 
 (defvar *config-path*
-  (merge-pathnames ".config/reposicle/config.lisp" (user-homedir-pathname)))
+  (merge-pathnames "repocicl/config.lisp" (uiop:xdg-config-home)))
 
-(defvar *reposicle-dir* (merge-pathnames "reposicle/" (user-homedir-pathname)))
+(defvar *repocicl-dir* (merge-pathnames "repocicl/" (user-homedir-pathname)))
 (defvar *common-lisp-dir* (merge-pathnames "common-lisp/" (user-homedir-pathname)))
 
 ;; ----------------------------------------------------------------------
-;; Low-level helpers (unchanged from previous solid version)
+;; Low-level helpers
 ;; ----------------------------------------------------------------------
 
 (defun ensure-dirs ()
-  (ensure-directories-exist *reposicle-dir*)
+  (ensure-directories-exist *repocicl-dir*)
   (ensure-directories-exist *common-lisp-dir*))
 
 (defun repo-name-from-url (url)
@@ -29,10 +29,13 @@
         name)))
 
 (defun local-repo-path (url)
-  (merge-pathnames (repo-name-from-url url) *reposicle-dir*))
+  (merge-pathnames (repo-name-from-url url) *repocicl-dir*))
 
-(defun symlink-path (repo-name)
-  (merge-pathnames repo-name *common-lisp-dir*))
+(defun symlink-path (asdf-name)
+  (merge-pathnames asdf-name *common-lisp-dir*))
+
+(defun symbolic-link-p (path)
+  &&&)
 
 (defun safe-delete-broken-symlink (path)
   (when (and (symbolic-link-p path) (not (probe-file path)))
@@ -45,9 +48,9 @@
       ((probe-file link)
        (unless (and (symbolic-link-p link)
                     (equal (truename link) (truename target)))
-         (error "Reposicle: ~A exists and is not our symlink. Refusing to overwrite." link)))
+         (error "Repocicl: ~A exists and is not our symlink. Refusing to overwrite." link)))
       (t
-       (format t "~&Reposicle: Symlinking ~A -> ~A~%" link target)
+       (format t "~&Repocicl: Symlinking ~A -> ~A~%" link target)
        (ensure-directories-exist (directory-namestring link))
        (create-symbolic-link target link)))))
 
@@ -62,9 +65,9 @@
   (let ((target (local-repo-path url)))
     (unless (directory-exists-p target)
       (when *offline-mode*
-        (warn "Reposicle [offline]: Skipping clone ~A" url)
+        (warn "Repocicl [offline]: Skipping clone ~A" url)
         (return-from git-clone nil))
-      (format t "~&Reposicle: Cloning ~A~%" url)
+      (format t "~&Repocicl: Cloning ~A~%" url)
       (run-program `("git" "clone" "--depth" "1" ,url ,target)
                    :output t :error-output :output :ignore-error-status t)
       (when (and ref (directory-exists-p target))
@@ -78,7 +81,7 @@
 (defun git-update (url &key ref)
   (let ((target (local-repo-path url)))
     (when (and (directory-exists-p target) (not *offline-mode*))
-      (format t "~&Reposicle: Updating ~A~%" url)
+      (format t "~&Repocicl: Updating ~A~%" url)
       (with-current-directory (target)
         (run-program '("git" "pull" "--ff-only" "--depth" "1")
                      :output t :error-output :output :ignore-error-status t)
@@ -90,21 +93,20 @@
 ;; Config loading
 ;; ----------------------------------------------------------------------
 
-(defun load-config (path &key if-does-not-exist)
-  (declare (ignore if-does-not-exist))
+(defun load-config (path)
   (when (probe-file path)
-    (format t "~&Reposicle: Loading config ~A~%" path)
-    (let ((*package* (find-package :reposicle)))
-      (load path))))
-
-(defun add-search (address)
-  (pushnew (string-right-trim "/" address) *search-addresses* :test #'string-equal))
+    (format t "~&Repocicl: Loading config ~A~%" path)
+    ;; &&& exclude any unapproved operations
+    (load path)))
 
 (defun ensure-cloned (url &key ref)
   (pushnew (if ref (list url :ref ref) url) *cloned-list* :test #'equal))
 
 (defun ensure-updated (url &key ref)
   (pushnew (if ref (list url :ref ref) url) *updated-list* :test #'equal))
+
+(defun add-search (url)
+  (pushnew (string-right-trim "/" url) *search-addresses* :test #'string-equal))
 
 ;; ----------------------------------------------------------------------
 ;; Strategies
@@ -144,10 +146,10 @@
           (when items
             (let* ((item (first items))
                    (repo-url (jsown:val (jsown:val item "repository") "html_url")))
-              (format t "~&Reposicle: GitHub discovered repo ~A for system ~S~%" repo-url system-name)
+              (format t "~&Repocicl: GitHub discovered repo ~A for system ~S~%" repo-url system-name)
               (concatenate 'string repo-url ".git"))))
       (error (e)
-        (warn "Reposicle: GitHub search error for ~A: ~A" system-name e)
+        (warn "Repocicl: GitHub search error for ~A: ~A" system-name e)
         nil))))
 
 (defun discover-via-remote (base system-name)
@@ -168,38 +170,32 @@
             (when repo-dir
               (let ((asd (find-top-level-asd repo-dir sys)))
                 (when asd
-                  (format t "~&Reposicle: Discovered and linked system ~S~%" sys)
+                  (format t "~&Repocicl: Discovered and linked system ~S~%" sys)
                   (return-from strategy-remote-discovery asd))))))))
     nil))
 
 ;; ----------------------------------------------------------------------
-;; Main ASDF entry point (exact order you specified)
+;; Main ASDF entry point
 ;; ----------------------------------------------------------------------
 
-(defun find-system-via-reposicle (system-name)
-  "Entry point — follows your exact strategy order."
-  (format t "~&Reposicle: Triggered for system ~S~%" system-name)
-
-  ;; 1. Refresh config
+(defun find-system-via-repocicl (system-name)
+  "ASDF entry point"
+  (format t "~&Repocicl: Triggered for system ~S~%" system-name)
+  ;; Refresh config
   (when (probe-file *config-path*)
     (load-config *config-path*))
-
-  ;; 2. Strategy: Ensure cloned
+  ;; Strategy: Ensure cloned
   (strategy-ensure-cloned)
-
-  ;; 3. Strategy: Ensure updated
+  ;; Strategy: Ensure updated
   (strategy-ensure-updated)
-
   ;; Re-scan ASDF after possible cloning (keeps registry current)
   (asdf:clear-configuration)
   (asdf:initialize-source-registry)
-
-  ;; 4. Strategy: Native ASDF discovery (local + symlinks)
+  ;; Strategy: Native ASDF discovery (local + symlinks)
   (let ((found (strategy-asdf-discovery system-name)))
     (when found
-      (return-from find-system-via-reposicle found)))
-
-  ;; 5. Final Strategy: Remote discovery
+      (return-from find-system-via-repocicl found)))
+  ;; Final Strategy: Remote discovery
   (strategy-remote-discovery system-name))
 
 ;; ----------------------------------------------------------------------
@@ -211,10 +207,10 @@
   (when (probe-file *config-path*)
     (load-config *config-path*))
   ;; Register at the very end of the search list
-  (unless (member 'find-system-via-reposicle asdf:*system-definition-search-functions*)
-    (appendf asdf:*system-definition-search-functions* '(find-system-via-reposicle)))
-  (format t "~&Reposicle: Setup complete (~D search addresses).~%"
-          (length *search-addresses*)))
+  (unless (member 'find-system-via-repocicl
+                  asdf:*system-definition-search-functions*)
+    (appendf asdf:*system-definition-search-functions*
+             '(find-system-via-repocicl))))
 
 (eval-when (:load-toplevel :execute)
   (setup))
