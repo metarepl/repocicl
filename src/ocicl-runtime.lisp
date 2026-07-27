@@ -59,6 +59,7 @@
 (in-package #:ocicl-runtime)
 
 (defvar *download* t)
+;; &&& copy me
 (defvar *verbose* nil)
 (defvar *force-global* nil)
 (defvar *local-only* (uiop:getenv "OCICL_LOCAL_ONLY"))
@@ -79,6 +80,7 @@
 (defvar *global-systems-csv-timestamp* 0)
 
 (defun split-on-delimiter (line delim)
+  ;; &&& replace me
   "Split LINE on DELIM character, returning list of trimmed substrings."
   (let ((start 0)
         (end 0)
@@ -112,6 +114,7 @@
   (split-on-delimiter line #\,))
 
 (defun should-log ()
+  ;; &&& copy me
   "Whether or not OCICL should output useful log info to *VERBOSE*."
   (and *verbose* (or (eq t *verbose*) (output-stream-p *verbose*))))
 
@@ -168,6 +171,7 @@
         (format *verbose* "; Error checking ocicl version: ~A~%" e)))))
 
 (defun sanitize-system-name (name)
+  ;; &&& copy me
   "Sanitize system name to prevent command injection."
   (let ((name-str (princ-to-string name)))
     ;; Only allow alphanumeric, dash, underscore, dot, plus, and slash
@@ -176,6 +180,7 @@
         (error "Invalid system name: ~A" name-str))))
 
 (defun ocicl-install (name)
+  ;; &&& copy me repocicl-clone repocicl-update
   "Install system NAME using the ocicl command."
   (verify-ocicl-version)
   (let* ((safe-name (sanitize-system-name name))
@@ -235,6 +240,7 @@
                          (t workdir))))))
 
 (defun initialize-globals ()
+  ;;  &&& copy me
   "Initialize global variables for local and global system directories and CSV files."
   (unless *local-systems-dir*
     (let ((workdir (find-workdir (uiop:getcwd))))
@@ -278,6 +284,7 @@
               (format *verbose* "; Error reading global systems CSV ~A: ~A~%" *global-systems-csv* e))))))))
 
 (defun find-asdf-system-file (name download-p)
+  ;; &&& copy me
   "Find ASDF system file for NAME, optionally downloading if DOWNLOAD-P is true."
   (initialize-globals)
   (labels ((try-load (systems systems-dir)
@@ -305,6 +312,7 @@
        (string= prefix (subseq string 0 (length prefix)))))
 
 (defun system-definition-searcher (name)
+  ;; &&& copy me
   "Search for ASDF system definition file for NAME, using ocicl if needed."
   (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
     (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
@@ -313,11 +321,13 @@
                  (string= (pathname-name system-file) name))
         system-file))))
 
+;; &&& copy me inside setup function
 (setf asdf:*system-definition-search-functions*
       (append asdf:*system-definition-search-functions*
               (list 'system-definition-searcher)))
 
 (defun system-list ()
+  ;; &&& copy me
   "Return list of all known system names from local and global registries."
   (initialize-globals)
   (append (when *local-ocicl-systems*
@@ -327,4 +337,5 @@
             (loop for key being the hash-keys of *global-ocicl-systems*
                   collect key))))
 
+;; &&& copy me
 (pushnew :OCICL *features*)

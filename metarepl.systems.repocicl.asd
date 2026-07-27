@@ -6,13 +6,15 @@
   :depends-on (
                :cmd
                :str
+               :pathname-utils
+               :filesystem-utils
+               ;;; vvv
                :cl-ppcre
                :chipz
                :alexandria
                :journal
                :local-time
                :filepaths
-               :filesystem-utils
                )
   :serial t
   :components ((:file "package")
