@@ -8,13 +8,9 @@
                :str
                :pathname-utils
                :filesystem-utils
-               ;;; vvv
-               :cl-ppcre
-               :chipz
-               :alexandria
-               :journal
-               :local-time
-               :filepaths
+               :quri
+               :dexador
+               :jsown
                )
   :serial t
   :components ((:file "package")

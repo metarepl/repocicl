@@ -1,8 +1,8 @@
 ;; add urls to search in priority order
-(repocicl:search "https://github.com/fukamachi/qlot")
-(repocicl:search "https://github.com/fukamachi/")
-(repocicl:search "https://github.com/metarepl/")
-(repocicl:search "https://github.com/fosskers")
+(repocicl:source "https://github.com/fukamachi/qlot")
+(repocicl:source "https://github.com/fukamachi/")
+(repocicl:source "https://github.com/metarepl/")
+(repocicl:source "https://github.com/fosskers")
 
 ;; add systems to ensure are cloned
 (repocicl:clone :metarepl.base.click)

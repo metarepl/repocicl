@@ -2,17 +2,21 @@
 
 (defvar *config-path*
   (merge-pathnames "repocicl/config.lisp" (uiop:xdg-config-home)))
+
 (defvar *repocicl-dir* (merge-pathnames "repocicl/" (user-homedir-pathname)))
 
 (defvar *common-lisp-dir* (merge-pathnames "common-lisp/" (user-homedir-pathname)))
 
-(defvar *offline-mode* (uiop:getenv "REPOCICL_OFFLINE"))
+(defvar *local-only* (uiop:getenv "REPOCICL_LOCAL_ONLY"))
 (defvar *github-token* (uiop:getenv "REPOCICL_GITHUB_TOKEN"))
+
 (defvar *verbose* nil)
 
 (defvar *search-addresses* nil) ; list of github urls to search for systems below
-(defvar *clone-list* nil)   ; list of URLs to ensure-cloned
-(defvar *fetch-list* nil)  ; list of URLs (or (url :ref "xxx")) to ensure-updated
+(defvar *clone-systems* nil)   ; list of URLs to ensure-cloned
+(defvar *fetch-systems* nil)  ; list of URLs (or (url :ref "xxx")) to ensure-updated
+
+(defvar *download* t)
 
 ;; ----------------------------------------------------------------------
 ;; Low-level helpers
@@ -143,7 +147,7 @@ collect key))))
 (defmethod clone-repo (url directory (repository-type (eql :hg)))
   (clone-repo-run '("hg" "clone") url directory))
 
-(defgeneric clone-repo (url directory &optional (repository-type :git))
+(defgeneric clone-repo (url directory repository-type)
   (:documentation "clone a repository of REPOSITORY-TYPE from URL, as a
 subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
@@ -165,11 +169,12 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
   (asdf:clear-configuration)
   (asdf:find-system asdf-system))
 
-(defun add-system (asdf-system &&&)
+(defun add-system (asdf-system)
   (when (not (system-available-p asdf-system))
     (progn
       (clone-system asdf-system)
       (make-system-available asdf-system))))
+
 (defun git-clone (url &key ref)
   "slop vesion"
   (let ((target (local-repo-path url)))
@@ -274,14 +279,14 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; ----------------------------------------------------------------------
 
 (defun strategy-ensure-cloned ()
-  "Process *clone-list*"
-  (dolist (entry *clone-list*)
+  "Process *clone-systems*"
+  (dolist (entry *clone-systems*)
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref))))
 
 (defun strategy-ensure-updated ()
-  "Process *fetch-list*"
-  (dolist (entry *fetch-list*)
+  "Process *fetch-systems*"
+  (dolist (entry *fetch-systems*)
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref)   ; ensure present first
       (git-update url :ref ref))))
@@ -334,7 +339,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
           (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
           (find-asdf-system-file name nil)))))
 
-(defun system-definition-searcher (name)
+(defun system-definition-searcher-old (name)
   ;; &&& copy me
   "Search for ASDF system definition file for NAME, using repocicl if needed."
   (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
@@ -360,7 +365,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
   ;; Strategy: Native ASDF discovery (local + symlinks)
   (let ((found (strategy-asdf-discovery system-name)))
     (when found
-      (return-from find-system-via-repocicl found)))
+      (return-from system-definition-searcher found)))
   ;; Final Strategy: Remote discovery
   (strategy-remote-discovery system-name))
 
@@ -368,10 +373,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; Config loading
 ;; ----------------------------------------------------------------------
 
-;; demo config
-;; &&& borrow format from qlot and cl-autorepo
-
-(defun load-config (path)
+(defun config-load (path)
   (when (probe-file path)
     (format t "~&Repocicl: Loading config ~A~%" path)
     ;; &&& exclude any unapproved operations
@@ -379,19 +381,25 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
     ;; url qc etc &&&
     (load path)))
 
-(defun search (url)
-  (pushnew (string-right-trim "/" url) *search-addresses* :test #'string-equal))
+(defun source (url)
+  (pushnew
+   (string-right-trim "/" url)
+   *search-addresses* :test #'string-equal))
 
 (defun clone (asdf-system &key type ref url)
-  (pushnew (if ref (list url :ref ref) url) *clone-list* :test #'equal))
+  (pushnew
+   (list :asdf-system asdf-system :type type :ref ref :url url)
+   *clone-systems* :test #'equal))
 
 (defun fetch (asdf-system &key type ref url)
-  (pushnew (if ref (list url :ref ref) url) *fetch-list* :test #'equal))
+  (pushnew
+   (list :asdf-system asdf-system :type type :ref ref :url url)
+   *fetch-systems* :test #'equal))
 
-(defun show-config ()
+(defun config-show ()
   "&&& not implemented")
 
-(defun clear-config ()
+(defun config-clear ()
   "&&& not implemented")
 
 ;; &&& move me
@@ -458,14 +466,19 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
   (when (probe-file *config-path*)
     (load-config *config-path*))
 
-  ;; Register at the very end of the search list
-  (unless (member 'repocicl:find-system-via-repocicl
+  ;; register search
+  (unless (member 'system-definition-searcher
                   asdf:*system-definition-search-functions*)
-    (setf asdf:*system-definition-search-functions*
-          (append asdf:*system-definition-search-functions*
-                  (list 'system-definition-searcher))))
+    ;;
+    ;; lowest priority at the tail of search list
+    ;; (setf asdf:*system-definition-search-functions*
+    ;;       (append asdf:*system-definition-search-functions*
+    ;;               (list 'system-definition-searcher)))
+    ;;
+    ;; highest priority at head of list
+    (pushnew 'system-definition-searcher asdf:*system-definition-search-functions*))
 
   (pushnew :REPOCICL *features*))
 
-(eval-when (:load-toplevel :execute)
-  (setup))
+;; (eval-when (:load-toplevel :execute)
+;;   (setup))
