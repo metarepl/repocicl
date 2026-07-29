@@ -3,7 +3,7 @@
   (:use #:cl #:uiop)
   (:export #:source
            #:clone
-           #:fetch
+           #:update
 
            #:config-load
            #:config-show
@@ -11,7 +11,7 @@
 
            #:*source-urls*
            #:*clone-systems*
-           #:*fetch-systems*
+           #:*update-systems*
 
            #:system-list
 

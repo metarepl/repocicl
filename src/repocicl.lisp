@@ -7,6 +7,7 @@
 
 (defvar *common-lisp-dir* (merge-pathnames "common-lisp/" (user-homedir-pathname)))
 
+(defvar *download* t)
 (defvar *local-only* (uiop:getenv "REPOCICL_LOCAL_ONLY"))
 (defvar *github-token* (uiop:getenv "REPOCICL_GITHUB_TOKEN"))
 
@@ -14,18 +15,20 @@
 
 (defvar *clone-systems* nil
   "a list of asdf system names to ensure are cloned")
-(defvar *fetch-systems* nil
+(defvar *update-systems* nil
   "a list of asdf system names to ensure are cloned and updated")
 (defvar *source-urls* nil
   "a list of github urls to search for systems below")
 
-(defvar *declared-available-systems* nil
-  "a list of systems the configuration explicitly names
+(defvar *declared-repocicl-systems* nil
+  "a hash table of system-name:systems
+which the configuration explicitly names
 and that have been installed by repocicl")
-(defvar *discovered-available-systems* nil
-  "a list of systems that have been discovered and installed by repocicl")
+(defvar *discovered-repocicl-systems* nil
+  "a hash table of system-name:systems
+which have been discovered by searches
+and that have been installed by repocicl")
 
-(defvar *download* t)
 
 ;; ----------------------------------------------------------------------
 ;; Low-level helpers
@@ -52,17 +55,19 @@ Sanitize system name to prevent command injection."
 (error "Invalid system name: ~A" name-str))))
 
 (defun repo-name-from-url (url)
-  (let* ((trimmed (string-right-trim "/" url))
+  (assert (str:ends-with-p ".git" url) ()
+          "a git url must end with .git")
+  (let* ((trimmed (string-right-trim ".git" url))
          (name (car (last (split-string trimmed :separator '(#\/))))))
-    (if (ends-with-subseq ".git" name)
-        (subseq name 0 (- (length name) 4))
-        name)))
+    name))
 
-(defun local-repo-path (url)
-  (merge-pathnames (repo-name-from-url url) *repocicl-dir*))
+(defun git-url-repocicl-repo-path (git-url)
+  (ensure-directory-pathname
+   (merge-pathnames (repo-name-from-url git-url) *repocicl-dir*)))
 
-(defun symlink-path (asdf-name)
-  (merge-pathnames asdf-name *common-lisp-dir*))
+(defun symlink-path (asd-file)
+   (make-pathname :defaults asd-file
+                  :directory (pathname-directory *common-lisp-dir*))))
 
 (defun symbolic-link-p (path)
   (org.shirakumo.filesystem-utils:symbolic-link-p path))
@@ -76,7 +81,6 @@ Sanitize system name to prevent command injection."
               (components-resolved (org.shirakumo.pathname-utils:components
                  (uiop:resolve-symlinks path)))
               ;; grab the variant field from the components
-              ;; tests with :directory were the only other option
               (namestring (getf components :namestring))
               (namestring-resolved (getf components-resolved :namestring))
               ;; clean up, ensure ~ is converted to /home/user
@@ -84,7 +88,19 @@ Sanitize system name to prevent command injection."
               (parsedstring (pathname-utils:native-namestring
                              namestring))
               (parsedstring-resolved (pathname-utils:native-namestring
-                                      namestring-resolved)))
+                                      namestring-resolved))
+
+              ;; tests with :directory were the only other option
+              ;; TODO still need to resolve ~ with out probes resolving the link
+              ;; (pathname (make-pathname :directory (getf components :directory)
+              ;;                          :name (getf components :name)
+              ;;                          :type (getf components :type)))
+
+              ;; (pathname-resolved
+              ;;   (make-pathname :directory (getf components-resolved :directory)
+              ;;                  :name (getf components-resolved :name)
+              ;;                  :type (getf components-resolved :type)))
+              )
          ;; namestring resolves to the symlink file
          ;; only when target not found
          (string= parsedstring parsedstring-resolved))))
@@ -94,18 +110,15 @@ Sanitize system name to prevent command injection."
              (symbolic-link-broken-p path))
     (delete-file path)))
 
-(defun create-or-update-symlink (target repo-name)
-  (let ((link (symlink-path repo-name)))
+(defun create-or-update-symlink (asd-file)
+  (let ((link (symlink-path asd-file)))
     (safe-delete-broken-symlink link)
-    (cond
-      ((probe-file link)
-       (unless (and (symbolic-link-p link)
-                    (equal (truename link) (truename target)))
-         (error "Repocicl: ~A exists and is not our symlink. Refusing to overwrite." link)))
-      (t
-       (format t "~&Repocicl: Symlinking ~A -> ~A~%" link target)
+    ;; if it still exists, it is a good link, a real file or not ours
+    (unless (probe-file link)
+      (when (should-log)
+        (format t "~&Repocicl: Symlinking ~A -> ~A~%" link asd-file))
        (ensure-directories-exist (directory-namestring link))
-       (create-symbolic-link target link)))))
+       (org.shirakumo.filesystem-utils:create-symbolic-link link asd-file))))
 
 (defun find-top-level-asd (repo-dir system-name)
   (let ((sys (string-downcase system-name)))
@@ -114,17 +127,17 @@ Sanitize system name to prevent command injection."
                    (search sys (namestring asd) :test #'char-equal))
           return asd)))
 
-(defun system-list (&key (shadowed nil))
-;; &&& replace ocicl
-"Return list of all known system names from *repocicl-dir*
-filtered by those which are not shadowed, or show shadowed"
-(initialize-globals)
-(append (when *local-ocicl-systems*
-(loop for key being the hash-keys of *local-ocicl-systems*
-collect key))
-(when *global-ocicl-systems*
-(loop for key being the hash-keys of *global-ocicl-systems*
-collect key))))
+(defun system-list (&key (declared t) (discovered t))
+  "copy ocicl
+Return list of all known system names"
+  (initialize-globals)
+  (append
+   (when (and declared *declared-repocicl-systems*)
+     (loop for key being the hash-keys of *declared-repocicl-systems*
+           collect key))
+   (when (and discovered *discovered-repocicl-systems*)
+     (loop for key being the hash-keys of *discovered-repocicl-systems*
+           collect key))))
 
 ;; ----------------------------------------------------------------------
 ;; git helpers
@@ -132,39 +145,71 @@ collect key))))
 
 ;;;; update system
 
-;; &&& follow clone system
+
+(defun update-repo-run (program-args url directory)
+  (uiop:run-program `(,@program-args ,url)
+                    :directory directory
+                    :output (should-log)
+                    :error-output (should-log)))
+
+(defmethod update-repo-gen (url directory (repository-type (eql :git)))
+  (update-repo-run '("git" "pull") url directory))
+
+(defmethod update-repo-gen (url directory (repository-type (eql :svn)))
+  (update-repo-run '("svn" "update") url directory))
+
+(defmethod update-repo-gen (url directory (repository-type (eql :darcs)))
+  (update-repo-run '("darcs" "pull" "-a") url directory))
+
+(defmethod update-repo-gen (url directory (repository-type (eql :hg)))
+  (update-repo-run '("hg" "pull" "-u") url directory))
+
+(defgeneric update-repo-gen (url directory repository-type)
+  (:documentation "fetch and update the working tree
+for an existing repository of REPOSITORY-TYPE from URL, as a subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
+
+(defun update-repo (git-url &key (repository-type :git)
+                           (target-dir *repocicl-dir*))
+  "Download the ASDF-SYSTEM of REPOSITORY-TYPE from the URL"
+  (let ((directory (git-url-repocicl-repo-path git-url)))
+    (when (should-log)
+      (format t "~&Repocicl: updating to: ~A" directory))
+    (update-repo-gen url target-dir repository-type)))
 
 ;;;; clone system
 
 (defun clone-repo-run (program-args url directory)
   (uiop:run-program `(,@program-args ,url)
                     :directory directory
-                    :output :interactive
-                    :error-output :interactive))
+                    :output (should-log)
+                    :error-output (should-log)))
 
-(defmethod clone-repo (url directory (repository-type (eql :git)))
+(defmethod clone-repo-gen (url directory (repository-type (eql :git)))
   (clone-repo-run '("git" "clone") url directory))
 
-(defmethod clone-repo (url directory (repository-type (eql :svn)))
+(defmethod clone-repo-gen (url directory (repository-type (eql :svn)))
   (clone-repo-run '("svn" "co") url directory))
 
-(defmethod clone-repo (url directory (repository-type (eql :darcs)))
+(defmethod clone-repo-gen (url directory (repository-type (eql :darcs)))
   (clone-repo-run '("darcs" "get") url directory))
 
-(defmethod clone-repo (url directory (repository-type (eql :hg)))
+(defmethod clone-repo-gen (url directory (repository-type (eql :hg)))
   (clone-repo-run '("hg" "clone") url directory))
 
-(defgeneric clone-repo (url directory repository-type)
+(defgeneric clone-repo-gen (url directory repository-type)
   (:documentation "clone a repository of REPOSITORY-TYPE from URL, as a
 subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
-(defun clone-system (url
-                     &key (repository-type :git) (repocicl-dir *repocicl-dir*))
+(defun clone-repo (git-url &key (repository-type :git)
+                           (target-dir *repocicl-dir*))
   "Download the ASDF-SYSTEM of REPOSITORY-TYPE from the URL"
-  (let ((directory (merge-pathnames
-                           (make-pathname :directory &&&) ;; from url
-                           repocicl-dir)))
-    (clone-repo url directory repository-type)))
+  (let ((directory (git-url-repocicl-repo-path git-url)))
+    (when (should-log)
+      (format t "~&Repocicl: cloning to: ~A" directory))
+    (clone-repo-gen git-url target-dir repository-type)
+    ))
+
+
 
 ;;;; check and act
 (defun system-available-p (asdf-system)
@@ -184,7 +229,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
 (defun git-clone (url &key ref)
   "slop vesion"
-  (let ((target (local-repo-path url)))
+  (let ((target (git-url-repocicl-repo-path url)))
     (unless (directory-exists-p target)
       (when *offline-mode*
         (warn "Repocicl [offline]: Skipping clone ~A" url)
@@ -202,7 +247,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
 (defun git-update (url &key ref)
   "slop version"
-  (let ((target (local-repo-path url)))
+  (let ((target (git-url-repocicl-repo-path url)))
     (when (and (directory-exists-p target) (not *offline-mode*))
       (format t "~&Repocicl: Updating ~A~%" url)
       (with-current-directory (target)
@@ -253,7 +298,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
         (error e))))
   (setf *local-systems-csv-timestamp* 0))
 
-;; &&& for clone and fetch because search only knows github
+;; &&& for clone and update because search only knows github
 ;; &&& if :type is not :git then url must be provided
 
 (defun github-code-search (owner system-name)
@@ -295,8 +340,8 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
       (git-clone url :ref ref))))
 
 (defun strategy-ensure-updated ()
-  "Process *fetch-systems*"
-  (dolist (entry *fetch-systems*)
+  "Process *update-systems*"
+  (dolist (entry *update-systems*)
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref)   ; ensure present first
       (git-update url :ref ref))))
@@ -414,13 +459,15 @@ finally search *source-urls* and install if found"
     (with-open-file (stream path :direction :input)
       (loop for form = (read stream nil :eof)
             until (eq form :eof)
-            do (config-apply form)))))
+            do (config-apply form)))
+
+    ))
 
 (defun config-apply (form)
   "dispatch on the expected config functions to exclude any unapproved operations"
   (case (first form)
     (repocicl:clone (apply 'repocicl:clone (rest form)))
-    (repocicl:fetch (apply 'repocicl:fetch (rest form)))
+    (repocicl:update (apply 'repocicl:update (rest form)))
     (repocicl:source (apply 'repocicl:source (rest form)))
     (t (warn "Unexpected form (not applied) in repocicl config:~%~S" form))
     ))
@@ -429,47 +476,46 @@ finally search *source-urls* and install if found"
   (when (should-log)
     (format t "~&Repocicl: configure source: ~S" url))
   ;; &&& qc config inputs, url
-  (pushnew
-   (string-right-trim "/" url)
-   *source-urls* :test #'string-equal))
+  (let ((tail (string-right-trim "/" url)))
+    (unless (member tail *source-urls* :test #'string=)
+      (setf *source-urls*
+            (append *source-urls* (list tail))))))
 
 (defun clone (asdf-system &key type ref url)
   (when (should-log)
     (format t "~&Repocicl: configure clone: ~S" asdf-system))
   ;; &&& qc config inputs, type ref url
-  (pushnew
-   (list :asdf-system (sanitize-system-name asdf-system)
-         :type type :ref ref :url url)
-   *clone-systems* :test #'equal))
 
-(defun fetch (asdf-system &key type ref url)
+  (let ((tail (list :asdf-system (sanitize-system-name asdf-system)
+                    :type type :ref ref :url url)))
+    (unless (member tail *clone-systems* :test #'equal)
+      (setf *clone-systems*
+            (append *clone-systems* (list tail))))))
+
+(defun update (asdf-system &key type ref url)
   (when (should-log)
-    (format t "~&Repocicl: configure clone: ~S" asdf-system))
+    (format t "~&Repocicl: configure update: ~S" asdf-system))
   ;; &&& qc config inputs, type ref url
-  (pushnew
-   (list :asdf-system (sanitize-system-name asdf-system)
-         :type type :ref ref :url url)
-   *fetch-systems* :test #'equal))
+  (let ((tail (list :asdf-system (sanitize-system-name asdf-system)
+                    :type type :ref ref :url url)))
+    (unless (member tail *update-systems* :test #'equal)
+      (setf *update-systems*
+            (append *update-systems* (list tail))))))
 
-(defun config-show (&key show-derivative)
+(defun config-show ()
   "shows the result of loading the config"
   (format t "~&~%clone:~{~&~S~}" *clone-systems*)
-  (format t "~&~%fetch:~{~&~S~}" *fetch-systems*)
-  (format t "~&~%source:~{~&~S~}" *source-urls*)
-  (when show-derivative
-    (format t "~&~%declared and available systems:~{~&~S~}"
-            *declared-available-systems*)
-    (format t "~&~%discovered and available systems:~{~&~S~}"
-            *discovered-available-systems*)))
+  (format t "~&~%update:~{~&~S~}" *update-systems*)
+  (format t "~&~%source:~{~&~S~}" *source-urls*))
 
 (defun config-clear ()
   "clears lists of systems and urls that were sourced from the config,
 and the lists of known systems that are derivative of the config"
   (setf *clone-systems* nil)
-  (setf *fetch-systems* nil)
+  (setf *update-systems* nil)
   (setf *source-urls* nil)
-  (setf *declared-available-systems* nil)
-  (setf *discovered-available-systems* nil))
+  (setf *declared-repocicl-systems* nil)
+  (setf *discovered-repocicl-systems* nil))
 
 ;; ----------------------------------------------------------------------
 ;; Setup
@@ -561,5 +607,5 @@ and the lists of known systems that are derivative of the config"
 
   (pushnew :REPOCICL *features*))
 
-(eval-when (:load-toplevel :execute)
+(eval-when (:execute)
   (setup))

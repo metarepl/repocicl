@@ -3,8 +3,8 @@
 (clone :filepaths)
 
 ;; add systems to ensure are cloned and latest
-(fetch :mito)
-(fetch :qlot)
+(update :mito)
+(update :qlot)
 
 ;; add urls to search in priority order
 (source "https://github.com/fukamachi/qlot")
@@ -14,5 +14,5 @@
 
 ;; specify ref andor type andor url
 ;; (clone :metarepl.base.click :repo-type :git :ref "hA5h")
-;; (fetch :metarepl.base.click :ref "hA5h")
+;; (update :metarepl.base.click :ref "hA5h")
 ;; (clone :filepaths :url "https://github.com/fosskers")
