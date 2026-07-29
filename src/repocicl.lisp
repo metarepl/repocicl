@@ -12,9 +12,18 @@
 
 (defvar *verbose* nil)
 
-(defvar *search-addresses* nil) ; list of github urls to search for systems below
-(defvar *clone-systems* nil)   ; list of URLs to ensure-cloned
-(defvar *fetch-systems* nil)  ; list of URLs (or (url :ref "xxx")) to ensure-updated
+(defvar *clone-systems* nil
+  "a list of asdf system names to ensure are cloned")
+(defvar *fetch-systems* nil
+  "a list of asdf system names to ensure are cloned and updated")
+(defvar *source-urls* nil
+  "a list of github urls to search for systems below")
+
+(defvar *declared-available-systems* nil
+  "a list of systems the configuration explicitly names
+and that have been installed by repocicl")
+(defvar *discovered-available-systems* nil
+  "a list of systems that have been discovered and installed by repocicl")
 
 (defvar *download* t)
 
@@ -22,8 +31,6 @@
 ;; Low-level helpers
 ;; ----------------------------------------------------------------------
 
-;; &&& test that ocicl is available goes into setup
-;; we assume ocicl has been setup and loaded successfuly before reposicle
 ;; for compatibility and a potential future merge we will copy some internal functions of ocicl
 
 (defun split-on-delimiter (line delim)
@@ -36,7 +43,7 @@ Whether or not OCICL should output useful log info to *VERBOSE*."
 (and *verbose* (or (eq t *verbose*) (output-stream-p *verbose*))))
 
 (defun sanitize-system-name (name)
-  " copy ocicl
+  "copy ocicl
 Sanitize system name to prevent command injection."
   (let ((name-str (princ-to-string name)))
     ;; Only allow alphanumeric, dash, underscore, dot, plus, and slash
@@ -108,7 +115,7 @@ Sanitize system name to prevent command injection."
           return asd)))
 
 (defun system-list (&key (shadowed nil))
-;; &&& copy me
+;; &&& replace ocicl
 "Return list of all known system names from *repocicl-dir*
 filtered by those which are not shadowed, or show shadowed"
 (initialize-globals)
@@ -246,6 +253,9 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
         (error e))))
   (setf *local-systems-csv-timestamp* 0))
 
+;; &&& for clone and fetch because search only knows github
+;; &&& if :type is not :git then url must be provided
+
 (defun github-code-search (owner system-name)
   "GitHub Code Search for top-level *.asd matching the system name."
   (when *offline-mode* (return-from github-code-search nil))
@@ -349,8 +359,11 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
                  (string= (pathname-name system-file) name))
         system-file))))
 
-(defun system-definition-searcher (system-name)
-  "ASDF entry point"
+(defun system-definition-searcher-local (system-name)
+  "ASDF entry point
+the first search method
+if configured explicitly install and use
+this has the effect of shadowing any other"
   (format t "~&Repocicl: Triggered for system ~S~%" system-name)
   ;; Refresh config
   (when (probe-file *config-path*)
@@ -365,7 +378,28 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
   ;; Strategy: Native ASDF discovery (local + symlinks)
   (let ((found (strategy-asdf-discovery system-name)))
     (when found
-      (return-from system-definition-searcher found)))
+      (return-from system-definition-searcher-local found))))
+
+(defun system-definition-searcher-remote (system-name)
+  "ASDF entry point
+all other search methods have not returned the system
+1st does repocicl have something not explicitly stated in the config
+finally search *source-urls* and install if found"
+  (format t "~&Repocicl: Triggered for system ~S~%" system-name)
+  ;; Refresh config
+  (when (probe-file *config-path*)
+    (load-config *config-path*))
+  ;; Strategy: Ensure cloned
+  (strategy-ensure-cloned)
+  ;; Strategy: Ensure updated
+  (strategy-ensure-updated)
+  ;; Re-scan ASDF after possible cloning (keeps registry current)
+  (asdf:clear-configuration)
+  (asdf:initialize-source-registry)
+  ;; Strategy: Native ASDF discovery (local + symlinks)
+  (let ((found (strategy-asdf-discovery system-name)))
+    (when found
+      (return-from system-definition-searcher-remote found)))
   ;; Final Strategy: Remote discovery
   (strategy-remote-discovery system-name))
 
@@ -375,40 +409,74 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
 (defun config-load (path)
   (when (probe-file path)
-    (format t "~&Repocicl: Loading config ~A~%" path)
-    ;; &&& exclude any unapproved operations
-    ;; sanitize system names
-    ;; url qc etc &&&
-    (load path)))
+    (when (should-log)
+      (format t "~&Repocicl: Loading config ~A~%" path))
+    (with-open-file (stream path :direction :input)
+      (loop for form = (read stream nil :eof)
+            until (eq form :eof)
+            do (config-apply form)))))
+
+(defun config-apply (form)
+  "dispatch on the expected config functions to exclude any unapproved operations"
+  (case (first form)
+    (repocicl:clone (apply 'repocicl:clone (rest form)))
+    (repocicl:fetch (apply 'repocicl:fetch (rest form)))
+    (repocicl:source (apply 'repocicl:source (rest form)))
+    (t (warn "Unexpected form (not applied) in repocicl config:~%~S" form))
+    ))
 
 (defun source (url)
+  (when (should-log)
+    (format t "~&Repocicl: configure source: ~S" url))
+  ;; &&& qc config inputs, url
   (pushnew
    (string-right-trim "/" url)
-   *search-addresses* :test #'string-equal))
+   *source-urls* :test #'string-equal))
 
 (defun clone (asdf-system &key type ref url)
+  (when (should-log)
+    (format t "~&Repocicl: configure clone: ~S" asdf-system))
+  ;; &&& qc config inputs, type ref url
   (pushnew
-   (list :asdf-system asdf-system :type type :ref ref :url url)
+   (list :asdf-system (sanitize-system-name asdf-system)
+         :type type :ref ref :url url)
    *clone-systems* :test #'equal))
 
 (defun fetch (asdf-system &key type ref url)
+  (when (should-log)
+    (format t "~&Repocicl: configure clone: ~S" asdf-system))
+  ;; &&& qc config inputs, type ref url
   (pushnew
-   (list :asdf-system asdf-system :type type :ref ref :url url)
+   (list :asdf-system (sanitize-system-name asdf-system)
+         :type type :ref ref :url url)
    *fetch-systems* :test #'equal))
 
-(defun config-show ()
-  "&&& not implemented")
+(defun config-show (&key show-derivative)
+  "shows the result of loading the config"
+  (format t "~&~%clone:~{~&~S~}" *clone-systems*)
+  (format t "~&~%fetch:~{~&~S~}" *fetch-systems*)
+  (format t "~&~%source:~{~&~S~}" *source-urls*)
+  (when show-derivative
+    (format t "~&~%declared and available systems:~{~&~S~}"
+            *declared-available-systems*)
+    (format t "~&~%discovered and available systems:~{~&~S~}"
+            *discovered-available-systems*)))
 
 (defun config-clear ()
-  "&&& not implemented")
-
-;; &&& move me
-;; &&& because search only knows github
-;; &&& if :type is not :git then url must be provided
+  "clears lists of systems and urls that were sourced from the config,
+and the lists of known systems that are derivative of the config"
+  (setf *clone-systems* nil)
+  (setf *fetch-systems* nil)
+  (setf *source-urls* nil)
+  (setf *declared-available-systems* nil)
+  (setf *discovered-available-systems* nil))
 
 ;; ----------------------------------------------------------------------
 ;; Setup
 ;; ----------------------------------------------------------------------
+
+;; &&& test that ocicl is available goes into setup
+;; we assume ocicl has been setup and loaded successfuly before reposicle
 
 (defun initialize-globals ()
   ;;  &&& copy me
@@ -455,30 +523,43 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
               (format *verbose* "; Error reading global systems CSV ~A: ~A~%" *global-systems-csv* e))))))))
 
 (defun ensure-dirs ()
+  (ensure-directories-exist *config-path*)
   (ensure-directories-exist *repocicl-dir*)
   (ensure-directories-exist *common-lisp-dir*))
 
-(defun setup ()
+(defun ensure-config ()
+  (unless (probe-file *config-path*)
+    (when (should-log)
+      (format t "creating a default config at XDG_CONFIG_HOME/repocicl"))
+    (uiop:copy-file
+     (asdf:system-relative-pathname :metarepl.systems.repocicl
+                                    "src/config-template.lisp")
+     *config-path*))
+  *config-path*)
 
-  (initialize-globals)
+(defun setup ()
   (ensure-dirs)
+  (ensure-config)
+  (initialize-globals)
 
   (when (probe-file *config-path*)
     (load-config *config-path*))
 
-  ;; register search
-  (unless (member 'system-definition-searcher
+  ;; register local search
+  (unless (member 'system-definition-searcher-local
                   asdf:*system-definition-search-functions*)
-    ;;
-    ;; lowest priority at the tail of search list
-    ;; (setf asdf:*system-definition-search-functions*
-    ;;       (append asdf:*system-definition-search-functions*
-    ;;               (list 'system-definition-searcher)))
-    ;;
     ;; highest priority at head of list
-    (pushnew 'system-definition-searcher asdf:*system-definition-search-functions*))
+    (pushnew 'system-definition-searcher-local asdf:*system-definition-search-functions*))
+
+    ;; register online search
+  (unless (member 'system-definition-searcher-remote
+                  asdf:*system-definition-search-functions*)
+    ;; lowest priority at the tail of search list
+    (setf asdf:*system-definition-search-functions*
+          (append asdf:*system-definition-search-functions*
+                  (list 'system-definition-searcher-remote))))
 
   (pushnew :REPOCICL *features*))
 
-;; (eval-when (:load-toplevel :execute)
-;;   (setup))
+(eval-when (:load-toplevel :execute)
+  (setup))
