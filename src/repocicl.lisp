@@ -322,6 +322,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
   (dolist (entry *clone-systems*)
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref))))
+;; &&& make system available after
 
 (defun strategy-ensure-updated ()
   "Process *update-systems*"
@@ -329,8 +330,9 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref)   ; ensure present first
       (git-update url :ref ref))))
+;; &&& make system available after
 
-(defun strategy-asdf-discovery (system-name)
+(defun strategy-local-discovery (system-name)
   "Let ASDF's normal mechanisms (including our symlinks in ~/common-lisp/) try to find the system.
    This keeps local discovery current after cloning."
   (asdf:search-for-system-definition system-name))
@@ -355,7 +357,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; Main ASDF entry point
 ;; ----------------------------------------------------------------------
 
-(defun find-asdf-system-file (name download-p)
+(defun find-asdf-system-file-old (name download-p )
   ;; &&& copy ocicl
   "Find ASDF system file for NAME, optionally downloading if DOWNLOAD-P is true."
   (initialize-globals)
@@ -378,9 +380,55 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
           (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
           (find-asdf-system-file name nil)))))
 
+(defun find-asdf-system-file (name download-p &optional (declared-p nil) (remote-p nil))
+  ;; &&& copy ocicl
+  "Find ASDF system file for NAME, optionally downloading if DOWNLOAD-P is true."
+  ;; refresh state
+  (initialize-globals)
+  ;; Strategy: Ensure cloned
+  (strategy-ensure-cloned)
+  ;; Strategy: Ensure updated
+  (strategy-ensure-updated)
+  (labels ((try-load (systems systems-dir)
+             (let ((match (and systems (gethash (mangle name) systems)))) ; lint:suppress
+               (when match
+                 (let ((pn (merge-pathnames (rest match) systems-dir)))
+                   (when (should-log)
+                     (format *verbose* "; checking for ~A: " pn))
+                   (if (uiop:file-exists-p pn)
+                       (progn
+                         (when (should-log) (format *verbose* "found~%"))
+                         pn)
+                       (when (should-log) (format *verbose* "missing~%"))))))))
+
+
+
+
+
+    ;; &&& use declared-p and remote-p to filter strategies
+
+    ;; &&& weave these strategies into the ocicl version
+    ;; local and declared
+    ;; (strategy-local-discovery system-name) ;; filtered for declared
+    ;; ;; local
+    ;; (strategy-local-discovery system-name)
+    ;; ;; remote search
+    ;; (strategy-remote-discovery system-name)
+
+
+
+
+    (or (try-load *local-ocicl-systems* *local-systems-dir*)
+        (unless *local-only*
+          (try-load *global-ocicl-systems* *global-systems-dir*))
+        (when download-p
+          (ocicl-install name)
+          (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
+          (find-asdf-system-file name nil)))))
+
 (defun system-definition-searcher-old (name)
   ;; &&& copy ocicl
-  "Search for ASDF system definition file for NAME, using repocicl if needed."
+  "Search for ASDF system definition file for NAME, using ocicl if needed."
   (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
     (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
            (system-file (find-asdf-system-file name *download*)))
@@ -388,49 +436,35 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
                  (string= (pathname-name system-file) name))
         system-file))))
 
-(defun system-definition-searcher-local (system-name)
-  "ASDF entry point
+(defun system-definition-searcher-declared (system-name)
+  " ASDF entry point
 the first search method
 if for systems explicitly configured: find, install and use
 has the effect of shadowing any other locations"
-  (format t "~&Repocicl: Triggered for system ~S~%" system-name)
-  ;; Refresh config
-  (when (probe-file *config-path*)
-    (load-config *config-path*))
-  ;; Strategy: Ensure cloned
-  (strategy-ensure-cloned)
-  ;; Strategy: Ensure updated
-  (strategy-ensure-updated)
-  ;; Re-scan ASDF after possible cloning (keeps registry current)
-  (asdf:clear-configuration)
-  (asdf:initialize-source-registry)
-  ;; Strategy: Native ASDF discovery (local + symlinks)
-  (let ((found (strategy-asdf-discovery system-name)))
-    (when found
-      (return-from system-definition-searcher-local found))))
+  (format t "~&Repocicl: Declared triggered for system ~S~%" system-name)
 
-(defun system-definition-searcher-remote (system-name)
+  (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
+    (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
+           ;; &&& ensure *download* is getting set by something
+           (system-file (find-asdf-system-file name *download* t nil)))
+      (when (and system-file
+                 (string= (pathname-name system-file) name))
+        system-file))))
+
+(defun system-definition-searcher-discovered (system-name)
   "ASDF entry point
 all other search methods have not returned the system
 1st does repocicl have something not explicitly stated in the config
 finally search *source-urls* and install if found"
-  (format t "~&Repocicl: Triggered for system ~S~%" system-name)
-  ;; Refresh config
-  (when (probe-file *config-path*)
-    (load-config *config-path*))
-  ;; Strategy: Ensure cloned
-  (strategy-ensure-cloned)
-  ;; Strategy: Ensure updated
-  (strategy-ensure-updated)
-  ;; Re-scan ASDF after possible cloning (keeps registry current)
-  (asdf:clear-configuration)
-  (asdf:initialize-source-registry)
-  ;; Strategy: Native ASDF discovery (local + symlinks)
-  (let ((found (strategy-asdf-discovery system-name)))
-    (when found
-      (return-from system-definition-searcher-remote found)))
-  ;; Final Strategy: Remote discovery
-  (strategy-remote-discovery system-name))
+  (format t "~&Repocicl: Remote search triggered for system ~S~%" system-name)
+
+  (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
+    (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
+           ;; &&& ensure *download* is getting set by something
+           (system-file (find-asdf-system-file name *download* nil t)))
+      (when (and system-file
+                 (string= (pathname-name system-file) name))
+        system-file))))
 
 ;; ----------------------------------------------------------------------
 ;; Config loading
@@ -586,20 +620,20 @@ Initialize global variables, and introspect the systems repocicl is managing rel
 
 
   ;; ;; register local search
-  ;; (unless (member 'system-definition-searcher-local
+  ;; (unless (member 'system-definition-searcher-declared
   ;;                 asdf:*system-definition-search-functions*)
   ;;   ;; highest priority at head of list
   ;;   (pushnew 'system-definition-searcher-local asdf:*system-definition-search-functions*))
 
   ;;   ;; register online search
-  ;; (unless (member 'system-definition-searcher-remote
+  ;; (unless (member 'system-definition-searcher-discovered
   ;;                 asdf:*system-definition-search-functions*)
   ;;   ;; lowest priority at the tail of search list
   ;;   (setf asdf:*system-definition-search-functions*
   ;;         (append asdf:*system-definition-search-functions*
   ;;                 (list 'system-definition-searcher-remote))))
 
-  ;; for now just use a simple search
+  ;; &&& for now just use a simple search
   (defvar *original-central-registry* asdf:*central-registry*
     "preserve original asdf:*central-registry* before repocicl makes modifications")
   (pushnew *repocicl-dir* asdf:*central-registry*)
