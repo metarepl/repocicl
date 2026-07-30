@@ -1,22 +1,32 @@
 (in-package :repocicl)
 
-(defvar *config-path*
-  (merge-pathnames "repocicl/config.lisp" (uiop:xdg-config-home)))
+(defvar *config-path* nil
+  "pathspec to a valid repocicl config file
+eg.
+(clone :system)
+(update :system)
+(source \"https://github.com/metarepl/)")
 
-(defvar *repocicl-dir* (merge-pathnames "repocicl/" (user-homedir-pathname)))
+(defvar *repocicl-dir* nil
+  "all managed repositories will be cloned under this directory")
 
-(defvar *common-lisp-dir* (merge-pathnames "common-lisp/" (user-homedir-pathname)))
+(defvar *common-lisp-dir* nil
+  "pathspec to a directory where asdf looks")
 
 (defvar *download* t)
+
 (defvar *local-only* (uiop:getenv "REPOCICL_LOCAL_ONLY"))
+
 (defvar *github-token* (uiop:getenv "REPOCICL_GITHUB_TOKEN"))
 
 (defvar *verbose* nil)
 
 (defvar *clone-systems* nil
   "a list of asdf system names to ensure are cloned")
+
 (defvar *update-systems* nil
   "a list of asdf system names to ensure are cloned and updated")
+
 (defvar *source-urls* nil
   "a list of github urls to search for systems below")
 
@@ -24,11 +34,11 @@
   "a hash table of system-name:systems
 which the configuration explicitly names
 and that have been installed by repocicl")
+
 (defvar *discovered-repocicl-systems* nil
   "a hash table of system-name:systems
 which have been discovered by searches
 and that have been installed by repocicl")
-
 
 ;; ----------------------------------------------------------------------
 ;; Low-level helpers
@@ -67,7 +77,7 @@ Sanitize system name to prevent command injection."
 
 (defun symlink-path (asd-file)
    (make-pathname :defaults asd-file
-                  :directory (pathname-directory *common-lisp-dir*))))
+                  :directory (pathname-directory *common-lisp-dir*)))
 
 (defun symbolic-link-p (path)
   (org.shirakumo.filesystem-utils:symbolic-link-p path))
@@ -140,11 +150,10 @@ Return list of all known system names"
            collect key))))
 
 ;; ----------------------------------------------------------------------
-;; git helpers
+;; core git
 ;; ----------------------------------------------------------------------
 
 ;;;; update system
-
 
 (defun update-repo-run (program-args url directory)
   (uiop:run-program `(,@program-args ,url)
@@ -210,52 +219,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
     ))
 
 
-
-;;;; check and act
-(defun system-available-p (asdf-system)
-  "check if download is needed"
-  (asdf:find-system asdf-system nil))
-
-(defun make-system-available (asdf-system)
-  "make system known to asdf"
-  (asdf:clear-configuration)
-  (asdf:find-system asdf-system))
-
-(defun add-system (asdf-system)
-  (when (not (system-available-p asdf-system))
-    (progn
-      (clone-system asdf-system)
-      (make-system-available asdf-system))))
-
-(defun git-clone (url &key ref)
-  "slop vesion"
-  (let ((target (git-url-repocicl-repo-path url)))
-    (unless (directory-exists-p target)
-      (when *offline-mode*
-        (warn "Repocicl [offline]: Skipping clone ~A" url)
-        (return-from git-clone nil))
-      (format t "~&Repocicl: Cloning ~A~%" url)
-      (run-program `("git" "clone" "--depth" "1" ,url ,target)
-                   :output t :error-output :output :ignore-error-status t)
-      (when (and ref (directory-exists-p target))
-        (with-current-directory (target)
-          (run-program `("git" "checkout" ,ref)
-                       :output t :error-output :output))))
-    (when (directory-exists-p target)
-      (create-or-update-symlink target (repo-name-from-url url))
-      target)))
-
-(defun git-update (url &key ref)
-  "slop version"
-  (let ((target (git-url-repocicl-repo-path url)))
-    (when (and (directory-exists-p target) (not *offline-mode*))
-      (format t "~&Repocicl: Updating ~A~%" url)
-      (with-current-directory (target)
-        (run-program '("git" "pull" "--ff-only" "--depth" "1")
-                     :output t :error-output :output :ignore-error-status t)
-        (when ref
-          (run-program `("git" "checkout" ,ref)
-                       :output nil :error-output :output))))))
+;; &&& vvv process me
 
 (defun repocicl-update (name)
   "Install system NAME using the ocicl command.
@@ -323,6 +287,26 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
         (warn "Repocicl: GitHub search error for ~A: ~A" system-name e)
         nil))))
 
+;; ----------------------------------------------------------------------
+;; strategy helpers
+;; ----------------------------------------------------------------------
+
+;;;; check and act
+(defun system-available-p (asdf-system)
+  "check if download is needed"
+  (asdf:find-system asdf-system nil))
+
+(defun make-system-available (asdf-system)
+  "make system known to asdf"
+  (asdf:clear-configuration)
+  (asdf:find-system asdf-system))
+
+(defun add-system (asdf-system)
+  (when (not (system-available-p asdf-system))
+    (progn
+      (clone-system asdf-system)
+      (make-system-available asdf-system))))
+
 (defun discover-via-remote (base system-name)
   (let ((owner (car (last (split-string (string-right-trim "/" base) :separator '(#\/))))))
     (or (github-code-search owner system-name)
@@ -372,7 +356,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; ----------------------------------------------------------------------
 
 (defun find-asdf-system-file (name download-p)
-  ;; &&& copy me
+  ;; &&& copy ocicl
   "Find ASDF system file for NAME, optionally downloading if DOWNLOAD-P is true."
   (initialize-globals)
   (labels ((try-load (systems systems-dir)
@@ -395,7 +379,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
           (find-asdf-system-file name nil)))))
 
 (defun system-definition-searcher-old (name)
-  ;; &&& copy me
+  ;; &&& copy ocicl
   "Search for ASDF system definition file for NAME, using repocicl if needed."
   (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
     (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
@@ -407,8 +391,8 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 (defun system-definition-searcher-local (system-name)
   "ASDF entry point
 the first search method
-if configured explicitly install and use
-this has the effect of shadowing any other"
+if for systems explicitly configured: find, install and use
+has the effect of shadowing any other locations"
   (format t "~&Repocicl: Triggered for system ~S~%" system-name)
   ;; Refresh config
   (when (probe-file *config-path*)
@@ -453,15 +437,13 @@ finally search *source-urls* and install if found"
 ;; ----------------------------------------------------------------------
 
 (defun config-load (path)
-  (when (probe-file path)
-    (when (should-log)
-      (format t "~&Repocicl: Loading config ~A~%" path))
-    (with-open-file (stream path :direction :input)
-      (loop for form = (read stream nil :eof)
-            until (eq form :eof)
-            do (config-apply form)))
-
-    ))
+  (when (should-log)
+    (format t "~&Repocicl: Loading config ~A~%" path))
+  (with-open-file (stream path :direction :input
+                               :if-does-not-exist :error)
+    (loop for form = (read stream nil :eof)
+          until (eq form :eof)
+          do (config-apply form))))
 
 (defun config-apply (form)
   "dispatch on the expected config functions to exclude any unapproved operations"
@@ -515,58 +497,39 @@ and the lists of known systems that are derivative of the config"
   (setf *update-systems* nil)
   (setf *source-urls* nil)
   (setf *declared-repocicl-systems* nil)
-  (setf *discovered-repocicl-systems* nil))
+  (setf *discovered-repocicl-systems* nil)
+  )
+
+;; ----------------------------------------------------------------------
+;; Repocicl state
+;; ----------------------------------------------------------------------
+
+(defun read-repocicl-state (&optional (repocicl-dir *repocicl-dir*))
+  "introspects the *repocicl-dir* for all cloned systems
+return hash table mapping system-name -> (version . path)
+where version is the git hash
+"
+  (when (should-log)
+    (format *verbose* "Repocicl: assessing ~A~%" repocicl-dir))
+  (let ((ht (make-hash-table :test #'equal))
+        (cloned-directories (uiop:subdirectories repocicl-dir)))
+    (dolist (dir cloned-directories)
+      ;; TODO prevent the ref generation when not a git repo or skip on the error
+      (let ((ref (str:trim (run-program '("git" "rev-parse" "HEAD")
+                                        :output :string
+                                        :directory dir)))
+             (asd-files  (directory-files dir "*.asd")))
+        (dolist (asd-file asd-files)
+          (let ((system-name (pathname-name asd-file)))
+            (setf (gethash system-name ht) (cons ref asd-file))))))
+    ht))
 
 ;; ----------------------------------------------------------------------
 ;; Setup
 ;; ----------------------------------------------------------------------
 
-;; &&& test that ocicl is available goes into setup
+;; TODO test that ocicl is available
 ;; we assume ocicl has been setup and loaded successfuly before reposicle
-
-(defun initialize-globals ()
-  ;;  &&& copy me
-  "Initialize global variables for local and global system directories and CSV files."
-  (unless *local-systems-dir*
-    (let ((workdir (find-workdir (uiop:getcwd))))
-      (setf *local-systems-dir* (merge-pathnames *relative-systems-dir* workdir))
-      (setf *local-systems-csv* (merge-pathnames *systems-csv* workdir))))
-
-  (unless (or *local-only* *global-systems-dir*)
-    (let* ((config-file (merge-pathnames "ocicl-globaldir.cfg" (get-ocicl-dir)))
-           (globaldir (if (uiop:file-exists-p config-file)
-                          (handler-case
-                              (uiop:ensure-absolute-pathname (uiop:read-file-line config-file))
-                            (error (e)
-                              (when (should-log)
-                                (format *verbose* "; Error reading config file ~A: ~A~%" config-file e))
-                              (get-ocicl-dir)))
-                          (get-ocicl-dir))))
-
-      (setf *global-systems-dir* (merge-pathnames *relative-systems-dir* globaldir))
-      (setf *global-systems-csv* (merge-pathnames *systems-csv* globaldir))))
-
-  (when (uiop:file-exists-p *local-systems-csv*)
-    (let ((timestamp (file-write-date *local-systems-csv*)))
-      (when (> timestamp *local-systems-csv-timestamp*)
-        (handler-case
-            (progn
-              (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
-              (setf *local-systems-csv-timestamp* timestamp))
-          (error (e)
-            (when (should-log)
-              (format *verbose* "; Error reading local systems CSV ~A: ~A~%" *local-systems-csv* e)))))))
-
-  (when (and (not *local-only*) (uiop:file-exists-p *global-systems-csv*))
-    (let ((timestamp (file-write-date *global-systems-csv*)))
-      (when (> timestamp *global-systems-csv-timestamp*)
-        (handler-case
-            (progn
-              (setf *global-ocicl-systems* (read-systems-csv *global-systems-csv*))
-              (setf *global-systems-csv-timestamp* timestamp))
-          (error (e)
-            (when (should-log)
-              (format *verbose* "; Error reading global systems CSV ~A: ~A~%" *global-systems-csv* e))))))))
 
 (defun ensure-dirs ()
   (ensure-directories-exist *config-path*)
@@ -574,36 +537,72 @@ and the lists of known systems that are derivative of the config"
   (ensure-directories-exist *common-lisp-dir*))
 
 (defun ensure-config ()
+  ;; the config exists or a default is placed
   (unless (probe-file *config-path*)
     (when (should-log)
-      (format t "creating a default config at XDG_CONFIG_HOME/repocicl"))
+      (format t "Repocicl: creating a default config at XDG_CONFIG_HOME/repocicl"))
     (uiop:copy-file
      (asdf:system-relative-pathname :metarepl.systems.repocicl
                                     "src/config-template.lisp")
      *config-path*))
+  ;; the config is loaded whenever any one is null
+  (when (or (null *clone-systems*)
+            (null *update-systems*)
+            (null *source-urls*))
+    (config-load *config-path*))
   *config-path*)
 
-(defun setup ()
+(defun initialize-globals ()
+  "copy ocicl
+Initialize global variables, and introspect the systems repocicl is managing relative to the configuration"
+
+  (unless *config-path*
+    (setf *config-path*
+          (merge-pathnames "repocicl/config.lisp" (uiop:xdg-config-home))))
+
+  (unless *repocicl-dir*
+    (setf *repocicl-dir*
+          (merge-pathnames "repocicl/" (user-homedir-pathname))))
+
+  (unless *common-lisp-dir*
+    (setf *common-lisp-dir*
+          (merge-pathnames "common-lisp/" (user-homedir-pathname))))
+
   (ensure-dirs)
   (ensure-config)
+
+  ;; TODO make separate responses in for discovered and declared
+  ;; copy ocicl (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
+  ;; *discovered-repocicl-systems* in config, high priority return, shadows other searches
+  ;; *declared-repocicl-systems* not in config, low priority return, shadowed by other searches
+  (setf *declared-repocicl-systems* (read-repocicl-state))
+  (setf *discovered-repocicl-systems* (read-repocicl-state)))
+
+(defun setup ()
   (initialize-globals)
 
-  (when (probe-file *config-path*)
-    (load-config *config-path*))
+  (defvar *original-system-definition-search-functions* asdf:*system-definition-search-functions*
+    "preserve original asdf:*system-definition-search-functions* before repocicl makes modifications")
 
-  ;; register local search
-  (unless (member 'system-definition-searcher-local
-                  asdf:*system-definition-search-functions*)
-    ;; highest priority at head of list
-    (pushnew 'system-definition-searcher-local asdf:*system-definition-search-functions*))
 
-    ;; register online search
-  (unless (member 'system-definition-searcher-remote
-                  asdf:*system-definition-search-functions*)
-    ;; lowest priority at the tail of search list
-    (setf asdf:*system-definition-search-functions*
-          (append asdf:*system-definition-search-functions*
-                  (list 'system-definition-searcher-remote))))
+  ;; ;; register local search
+  ;; (unless (member 'system-definition-searcher-local
+  ;;                 asdf:*system-definition-search-functions*)
+  ;;   ;; highest priority at head of list
+  ;;   (pushnew 'system-definition-searcher-local asdf:*system-definition-search-functions*))
+
+  ;;   ;; register online search
+  ;; (unless (member 'system-definition-searcher-remote
+  ;;                 asdf:*system-definition-search-functions*)
+  ;;   ;; lowest priority at the tail of search list
+  ;;   (setf asdf:*system-definition-search-functions*
+  ;;         (append asdf:*system-definition-search-functions*
+  ;;                 (list 'system-definition-searcher-remote))))
+
+  ;; for now just use a simple search
+  (defvar *original-central-registry* asdf:*central-registry*
+    "preserve original asdf:*central-registry* before repocicl makes modifications")
+  (pushnew *repocicl-dir* asdf:*central-registry*)
 
   (pushnew :REPOCICL *features*))
 
