@@ -1,7 +1,8 @@
 (in-package :repocicl)
 
+; set by initialize-globals
 (defvar *config-path* nil
-  "pathspec to a valid repocicl config file
+  "pathspec to a repocicl config file
 eg.
 (clone :system)
 (update :system)
@@ -11,16 +12,21 @@ eg.
   "all managed repositories will be cloned under this directory")
 
 (defvar *common-lisp-dir* nil
-  "pathspec to a directory where asdf looks")
+  "pathspec to a directory where asdf always looks")
 
-(defvar *download* t)
+(defvar *local-only* nil
+  "result of reading environment for REPOCICL_LOCAL_ONLY")
 
-(defvar *local-only* (uiop:getenv "REPOCICL_LOCAL_ONLY"))
+(defvar *github-token* nil
+  "result of reading environment for REPOCICL_GITHUB_TOKEN")
 
-(defvar *github-token* (uiop:getenv "REPOCICL_GITHUB_TOKEN"))
+(defparameter *verbose* nil
+  "controls logging")
 
-(defvar *verbose* nil)
+(defparameter *download* nil
+  "controls download logic at point of decision")
 
+;; set by ensure-config
 (defvar *clone-systems* nil
   "a list of asdf system names to ensure are cloned")
 
@@ -30,15 +36,21 @@ eg.
 (defvar *source-urls* nil
   "a list of github urls to search for systems below")
 
+;; set by read-repocicl-state
 (defvar *declared-repocicl-systems* nil
-  "a hash table of system-name:systems
-which the configuration explicitly names
-and that have been installed by repocicl")
+  "a hash table mapping system-name -> (version . path)
+these systems are repos cloned by repocicl, declared in config, they are high priority return, shadows other searches
+similar to ocicl:*local-ocicl-systems*")
 
 (defvar *discovered-repocicl-systems* nil
-  "a hash table of system-name:systems
-which have been discovered by searches
-and that have been installed by repocicl")
+  "a hash table mapping system-name -> (version . path)
+  these systems are repos cloned by repocicl, not declared in config, low priority return, shadowed by other searches
+similar to ocicl:*global-ocicl-systems*")
+
+;; set by user
+(defvar *pause-repocicl-actions* nil
+  "prevent repocicl from doing anything
+when no further package aquisition is expected the user can prevent overhead")
 
 ;; ----------------------------------------------------------------------
 ;; Low-level helpers
@@ -58,18 +70,64 @@ Whether or not OCICL should output useful log info to *VERBOSE*."
 (defun sanitize-system-name (name)
   "copy ocicl
 Sanitize system name to prevent command injection."
-  (let ((name-str (princ-to-string name)))
+  (let ((name-str
+          (string-downcase (princ-to-string name))))
     ;; Only allow alphanumeric, dash, underscore, dot, plus, and slash
-    (if (every (lambda (c) (or (alphanumericp c) (find c "-_.+/"))) name-str)
+    (if (every
+         (lambda (c) (or (alphanumericp c) (find c "-_.+/"))) name-str)
         name-str
-(error "Invalid system name: ~A" name-str))))
+        (error "Invalid system name: ~A" name-str))))
 
-(defun repo-name-from-url (url)
-  (assert (str:ends-with-p ".git" url) ()
+(defun create-system-name (system-name-source)
+  "can take keyword or asd file or other things
+returns a uniform sanitized string
+use to create
+keys of declared-repocicl-systems
+keys of discovered-repocicl-systems
+elements of *clone-systems*
+elements of *update-systems*
+
+"
+  (cond
+    ;; keyword
+    ((keywordp system-name-source)
+     ;; &&& convert kw?
+     (sanitize-system-name system-name-source))
+
+    ;; asd file
+    ((pathnamep system-name-source)
+     (sanitize-system-name (pathname-name system-name-source)))
+
+    ;; string
+    ((stringp system-name-source)
+     (sanitize-system-name system-name-source))))
+
+(defun repo-owner-from-url (git-url)
+  "a git url like: https://SITE.com/OWNER/REPONAME.git
+  or like: https://SITE.com/OWNER"
+  (assert (str:starts-with-p "https://" git-url) ()
+          "a git url must start with https://")
+  (let* ((trimmed
+           (string-right-trim "/"
+                              (string-right-trim ".git"
+                                                 (string-left-trim "https://" git-url))))
+         (split (split-on-delimiter trimmed "/"))
+         (owner (nth 1 split)))
+    (string-downcase owner)))
+
+(defun repo-name-from-url (git-url)
+  "a git url like: https://SITE.com/OWNER/REPONAME.git"
+  (assert (str:ends-with-p ".git" git-url) ()
           "a git url must end with .git")
-  (let* ((trimmed (string-right-trim ".git" url))
-         (name (car (last (split-string trimmed :separator '(#\/))))))
-    name))
+  (assert (str:starts-with-p "https://" git-url) ()
+          "a git url must start with https://")
+  (let* ((trimmed
+           (string-right-trim ".git"
+                              (string-left-trim "https://" git-url))
+           )
+         (split (split-on-delimiter trimmed "/"))
+         (name (nth 2 split)))
+    (string-downcase name)))
 
 (defun git-url-repocicl-repo-path (git-url)
   (ensure-directory-pathname
@@ -268,7 +326,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 (defun github-code-search (owner system-name)
   "GitHub Code Search for top-level *.asd matching the system name."
   (when *offline-mode* (return-from github-code-search nil))
-  (let* ((query (format nil "extension:asd ~A in:path" (string-downcase system-name)))
+  (let* ((query (format nil "extension:asd ~A in:path" system-name))
          (url (format nil "https://api.github.com/search/code?q=~A+user:~A"
                       (quri:url-encode query) owner))
          (headers (when *github-token*
@@ -316,24 +374,35 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; ----------------------------------------------------------------------
 ;; Strategies
 ;; ----------------------------------------------------------------------
+(defun strategy-local-discovery (system-name systems)
+  "copy ocicl try-load "
+  (let ((match (and systems
+                    (gethash system-name systems))))
+    (when match
+      (let ((system-file (cdr match)))
+        (when (should-log)
+          (format *verbose* "; checking for ~A: " system-file))
+        (if (uiop:file-exists-p system-file)
+            (progn
+              (when (should-log) (format *verbose* "found~%"))
+              system-file)
+            (when (should-log) (format *verbose* "missing~%")))))))
 
-(defun strategy-ensure-cloned ()
+(defun strategy-ensure-cloned (system-name)
   "Process *clone-systems*"
   (dolist (entry *clone-systems*)
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref))))
-;; &&& make system available after
 
-(defun strategy-ensure-updated ()
+(defun strategy-ensure-updated (system-name)
   "Process *update-systems*"
   (dolist (entry *update-systems*)
     (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
       (git-clone url :ref ref)   ; ensure present first
       (git-update url :ref ref))))
-;; &&& make system available after
 
-(defun strategy-local-discovery (system-name)
-  "Let ASDF's normal mechanisms (including our symlinks in ~/common-lisp/) try to find the system.
+(defun strategy-asdf-discovery (system-name)
+  "Let ASDF's normal mechanisms (including symlinks in ~/common-lisp/) try to find the system.
    This keeps local discovery current after cloning."
   (asdf:search-for-system-definition system-name))
 
@@ -357,113 +426,69 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; Main ASDF entry point
 ;; ----------------------------------------------------------------------
 
-(defun find-asdf-system-file-old (name download-p )
+(defun find-asdf-system-file (system-name download-p &key (declared-p nil))
   ;; &&& copy ocicl
-  "Find ASDF system file for NAME, optionally downloading if DOWNLOAD-P is true."
-  (initialize-globals)
-  (labels ((try-load (systems systems-dir)
-             (let ((match (and systems (gethash (mangle name) systems)))) ; lint:suppress
-               (when match
-                   (let ((pn (merge-pathnames (rest match) systems-dir)))
-                     (when (should-log)
-                       (format *verbose* "; checking for ~A: " pn))
-                     (if (uiop:file-exists-p pn)
-                         (progn
-                           (when (should-log) (format *verbose* "found~%"))
-                           pn)
-                         (when (should-log) (format *verbose* "missing~%"))))))))
-    (or (try-load *local-ocicl-systems* *local-systems-dir*)
-        (unless *local-only*
-          (try-load *global-ocicl-systems* *global-systems-dir*))
-        (when download-p
-          (ocicl-install name)
-          (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
-          (find-asdf-system-file name nil)))))
+  "Find ASDF system file for SYSTEM-NAME, optionally downloading if DOWNLOAD-P is true."
 
-(defun find-asdf-system-file (name download-p &optional (declared-p nil) (remote-p nil))
-  ;; &&& copy ocicl
-  "Find ASDF system file for NAME, optionally downloading if DOWNLOAD-P is true."
   ;; refresh state
   (initialize-globals)
-  ;; Strategy: Ensure cloned
-  (strategy-ensure-cloned)
-  ;; Strategy: Ensure updated
-  (strategy-ensure-updated)
-  (labels ((try-load (systems systems-dir)
-             (let ((match (and systems (gethash (mangle name) systems)))) ; lint:suppress
-               (when match
-                 (let ((pn (merge-pathnames (rest match) systems-dir)))
-                   (when (should-log)
-                     (format *verbose* "; checking for ~A: " pn))
-                   (if (uiop:file-exists-p pn)
-                       (progn
-                         (when (should-log) (format *verbose* "found~%"))
-                         pn)
-                       (when (should-log) (format *verbose* "missing~%"))))))))
 
+  (or (when declared-p
+        (strategy-local-discovery system-name *declared-repocicl-systems*))
 
+      (when (and download-p declared-p)
+        (strategy-ensure-cloned system-name)
+        (strategy-ensure-updated system-name)
+        (read-repocicl-state)
+        ;; nil download-p also guards recurrence
+        (find-asdf-system-file system-name nil :declared-p t))
 
+      (when (not declared-p)
+        (strategy-local-discovery system-name *discovered-repocicl-systems*))
 
+      (when download-p
+        (strategy-remote-discovery system-name)
+        (read-repocicl-state)
+        ;; nil download-p also guards recurrence
+        (find-asdf-system-file system-name nil))
 
-    ;; &&& use declared-p and remote-p to filter strategies
+      ))
 
-    ;; &&& weave these strategies into the ocicl version
-    ;; local and declared
-    ;; (strategy-local-discovery system-name) ;; filtered for declared
-    ;; ;; local
-    ;; (strategy-local-discovery system-name)
-    ;; ;; remote search
-    ;; (strategy-remote-discovery system-name)
-
-
-
-
-    (or (try-load *local-ocicl-systems* *local-systems-dir*)
-        (unless *local-only*
-          (try-load *global-ocicl-systems* *global-systems-dir*))
-        (when download-p
-          (ocicl-install name)
-          (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
-          (find-asdf-system-file name nil)))))
-
-(defun system-definition-searcher-old (name)
-  ;; &&& copy ocicl
-  "Search for ASDF system definition file for NAME, using ocicl if needed."
-  (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
-    (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
-           (system-file (find-asdf-system-file name *download*)))
-      (when (and system-file
-                 (string= (pathname-name system-file) name))
-        system-file))))
-
-(defun system-definition-searcher-declared (system-name)
+(defun system-definition-searcher-declared (name)
   " ASDF entry point
 the first search method
-if for systems explicitly configured: find, install and use
-has the effect of shadowing any other locations"
-  (format t "~&Repocicl: Declared triggered for system ~S~%" system-name)
-
-  (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
+for systems explicitly configured: find, install and use
+has the effect of shadowing any other places the system can be found"
+  (unless (or *pause-repocicl-actions*
+              (starts-with-p "asdf/" name)
+              (string= "asdf" name)
+              (starts-with-p "uiop/" name)
+              (string= "uiop" name))
+    (format t "~&Repocicl: type: declared search triggered for system ~S~%" name)
     (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
-           ;; &&& ensure *download* is getting set by something
-           (system-file (find-asdf-system-file name *download* t nil)))
+           (system-name (create-system-name name))
+           (system-file (find-asdf-system-file system-name *download* :declared-p t)))
       (when (and system-file
-                 (string= (pathname-name system-file) name))
+                 (string= (create-system-name system-file) system-name))
         system-file))))
 
-(defun system-definition-searcher-discovered (system-name)
+(defun system-definition-searcher-discovered (name)
   "ASDF entry point
+the last search method
 all other search methods have not returned the system
 1st does repocicl have something not explicitly stated in the config
 finally search *source-urls* and install if found"
-  (format t "~&Repocicl: Remote search triggered for system ~S~%" system-name)
-
-  (unless (or (starts-with-p "asdf/" name) (string= "asdf" name) (string= "uiop" name))
+  (unless (or *pause-repocicl-actions*
+              (starts-with-p "asdf/" name)
+              (string= "asdf" name)
+              (starts-with-p "uiop/" name)
+              (string= "uiop" name))
+    (format t "~&Repocicl: type: discovered search triggered for system ~S~%" name)
     (let* ((*verbose* (or *verbose* asdf:*verbose-out*))
-           ;; &&& ensure *download* is getting set by something
-           (system-file (find-asdf-system-file name *download* nil t)))
+           (system-name (create-system-name name))
+           (system-file (find-asdf-system-file system-name *download* :declared-p nil)))
       (when (and system-file
-                 (string= (pathname-name system-file) name))
+                 (string= (create-system-name system-file) system-name))
         system-file))))
 
 ;; ----------------------------------------------------------------------
@@ -502,7 +527,7 @@ finally search *source-urls* and install if found"
     (format t "~&Repocicl: configure clone: ~S" asdf-system))
   ;; &&& qc config inputs, type ref url
 
-  (let ((tail (list :asdf-system (sanitize-system-name asdf-system)
+  (let ((tail (list :asdf-system (create-system-name asdf-system)
                     :type type :ref ref :url url)))
     (unless (member tail *clone-systems* :test #'equal)
       (setf *clone-systems*
@@ -512,7 +537,7 @@ finally search *source-urls* and install if found"
   (when (should-log)
     (format t "~&Repocicl: configure update: ~S" asdf-system))
   ;; &&& qc config inputs, type ref url
-  (let ((tail (list :asdf-system (sanitize-system-name asdf-system)
+  (let ((tail (list :asdf-system (create-system-name asdf-system)
                     :type type :ref ref :url url)))
     (unless (member tail *update-systems* :test #'equal)
       (setf *update-systems*
@@ -538,32 +563,54 @@ and the lists of known systems that are derivative of the config"
 ;; Repocicl state
 ;; ----------------------------------------------------------------------
 
-(defun read-repocicl-state (&optional (repocicl-dir *repocicl-dir*))
+(defun read-repocicl-state (&key (declared nil) (discovered nil) (set-globals t) (repocicl-dir *repocicl-dir*))
   "introspects the *repocicl-dir* for all cloned systems
 return hash table mapping system-name -> (version . path)
 where version is the git hash
+
+uses systems explicitly mentioned in config (clone x) (update x)
+to determine if the system is declared or is a discovered system
+
+sets the global vars *declared-repocicl-systems* *discovered-repocicl-systems*
+to the respective hashtable
+
+the keys discovered and declared select which hashtable is returned
 "
   (when (should-log)
     (format *verbose* "Repocicl: assessing ~A~%" repocicl-dir))
-  (let ((ht (make-hash-table :test #'equal))
-        (cloned-directories (uiop:subdirectories repocicl-dir)))
+
+  (let ((ht-declared (make-hash-table :test #'equal))
+        (ht-discovered (make-hash-table :test #'equal))
+        (cloned-directories (uiop:subdirectories repocicl-dir))
+        (declared-systems (mapcar (lambda (conf-line) (getf conf-line :asdf-system))
+                                  (append *clone-systems* *update-systems*))))
     (dolist (dir cloned-directories)
       ;; TODO prevent the ref generation when not a git repo or skip on the error
       (let ((ref (str:trim (run-program '("git" "rev-parse" "HEAD")
-                                        :output :string
-                                        :directory dir)))
-             (asd-files  (directory-files dir "*.asd")))
+                                         :output :string
+                                         :directory dir)))
+            (asd-files  (directory-files dir "*.asd")))
         (dolist (asd-file asd-files)
-          (let ((system-name (pathname-name asd-file)))
-            (setf (gethash system-name ht) (cons ref asd-file))))))
-    ht))
+          (let ((system-name (create-system-name asd-file)))
+            (if (member system-name declared-systems :test #'string=)
+                ;; declared is all in clone-systems and update-systems
+                (setf (gethash system-name ht-declared) (cons ref asd-file))
+                ;; discovered is all, removing declared
+                (setf (gethash system-name ht-discovered) (cons ref asd-file)))
+            ))))
+    (when set-globals
+      (setf *declared-repocicl-systems* ht-declared)
+      (setf *discovered-repocicl-systems* ht-discovered))
+    ;; choose hash table to return
+    (when declared
+        ht-declared)
+    (when discovered
+      ht-discovered)
+    ))
 
 ;; ----------------------------------------------------------------------
 ;; Setup
 ;; ----------------------------------------------------------------------
-
-;; TODO test that ocicl is available
-;; we assume ocicl has been setup and loaded successfuly before reposicle
 
 (defun ensure-dirs ()
   (ensure-directories-exist *config-path*)
@@ -590,6 +637,9 @@ where version is the git hash
   "copy ocicl
 Initialize global variables, and introspect the systems repocicl is managing relative to the configuration"
 
+  (unless *verbose*
+    (setf *verbose* nil))
+
   (unless *config-path*
     (setf *config-path*
           (merge-pathnames "repocicl/config.lisp" (uiop:xdg-config-home))))
@@ -602,28 +652,38 @@ Initialize global variables, and introspect the systems repocicl is managing rel
     (setf *common-lisp-dir*
           (merge-pathnames "common-lisp/" (user-homedir-pathname))))
 
+  (setf *github-token* (uiop:getenv "REPOCICL_GITHUB_TOKEN"))
+
+  (setf *local-only* (uiop:getenv "REPOCICL_LOCAL_ONLY"))
+
+  (if *local-only*
+      (setf *download* nil)
+      (setf *download* t))
+
   (ensure-dirs)
   (ensure-config)
-
-  ;; TODO make separate responses in for discovered and declared
-  ;; copy ocicl (setf *local-ocicl-systems* (read-systems-csv *local-systems-csv*))
-  ;; *discovered-repocicl-systems* in config, high priority return, shadows other searches
-  ;; *declared-repocicl-systems* not in config, low priority return, shadowed by other searches
-  (setf *declared-repocicl-systems* (read-repocicl-state))
-  (setf *discovered-repocicl-systems* (read-repocicl-state)))
+  (read-repocicl-state))
 
 (defun setup ()
+
+  ;; test that ocicl is available
+  (unless (member :ocicl *features*)
+    ;; TODO make error continuable
+    (error "repocicl assumes ocicl has been setup and loaded!
+see readme for installation examples"))
+
+  ;; TODO ocicl repocicl installation and sbclrc example section
+
   (initialize-globals)
 
   (defvar *original-system-definition-search-functions* asdf:*system-definition-search-functions*
-    "preserve original asdf:*system-definition-search-functions* before repocicl makes modifications")
-
+    "preserve asdf:*system-definition-search-functions* before repocicl makes modifications")
 
   ;; ;; register local search
   ;; (unless (member 'system-definition-searcher-declared
   ;;                 asdf:*system-definition-search-functions*)
   ;;   ;; highest priority at head of list
-  ;;   (pushnew 'system-definition-searcher-local asdf:*system-definition-search-functions*))
+  ;;   (pushnew 'system-definition-searcher-declared asdf:*system-definition-search-functions*))
 
   ;;   ;; register online search
   ;; (unless (member 'system-definition-searcher-discovered
@@ -631,12 +691,17 @@ Initialize global variables, and introspect the systems repocicl is managing rel
   ;;   ;; lowest priority at the tail of search list
   ;;   (setf asdf:*system-definition-search-functions*
   ;;         (append asdf:*system-definition-search-functions*
-  ;;                 (list 'system-definition-searcher-remote))))
+  ;;                 (list 'system-definition-searcher-discovered))))
 
   ;; &&& for now just use a simple search
   (defvar *original-central-registry* asdf:*central-registry*
-    "preserve original asdf:*central-registry* before repocicl makes modifications")
+    "preserve asdf:*central-registry* before repocicl makes modifications")
+
   (pushnew *repocicl-dir* asdf:*central-registry*)
+
+  ;; repocicl is fully established
+  (defvar *original-features* *features*
+    "preserve *features before repocicl makes modifications")
 
   (pushnew :REPOCICL *features*))
 
