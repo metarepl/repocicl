@@ -91,7 +91,6 @@ elements of *update-systems*
   (cond
     ;; keyword
     ((keywordp system-name-source)
-     ;; &&& convert kw?
      (sanitize-system-name system-name-source))
 
     ;; asd file
@@ -375,7 +374,7 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 ;; Strategies
 ;; ----------------------------------------------------------------------
 (defun strategy-local-discovery (system-name systems)
-  "copy ocicl try-load "
+  "copy ocicl try-load"
   (let ((match (and systems
                     (gethash system-name systems))))
     (when match
@@ -388,47 +387,102 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
               system-file)
             (when (should-log) (format *verbose* "missing~%")))))))
 
+
+
 (defun strategy-ensure-cloned (system-name)
-  "Process *clone-systems*"
-  (dolist (entry *clone-systems*)
-    (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
-      (git-clone url :ref ref))))
+
+  ;; do nothing if it has already been found in the repocicl-dir
+  (unless (member system-name
+                  (loop for k being the hash-keys of *declared-repocicl-systems* collect k)
+                  :test #'string=)
+    (let* (
+           ;; must be in *clone-sytems* or *update-systems*
+           (all-declarations (append *clone-systems* *update-systems*))
+           (conf-line
+             (find-if (lambda (conf-line)
+                        (string= system-name (getf conf-line :asdf-system)))
+                      all-declarations))
+           )
+
+      ;; and not yet in *declared-repocicl-systems*
+      (when conf-line
+        (let (
+              (asdf-system (getf conf-line :asdf-system))
+              (type (getf conf-line :type))
+              (ref (getf conf-line :ref))
+              (url (getf conf-line :url))
+              )
+
+          ;; &&&
+          (uiop:not-implemented-error 'git-clone-call )
+          (read-repocicl-state)
+          )))))
 
 (defun strategy-ensure-updated (system-name)
-  "Process *update-systems*"
-  (dolist (entry *update-systems*)
-    (destructuring-bind (url &key ref) (if (consp entry) entry (list entry))
-      (git-clone url :ref ref)   ; ensure present first
-      (git-update url :ref ref))))
+  ;; must already be in *declared-repocicl-systems*
+  (when (member system-name
+                (loop for k being the hash-keys of *declared-repocicl-systems* collect k)
+                :test #'string=)
+    (let (
+          (conf-line
+            (find-if (lambda (conf-line)
+                       (string= system-name (getf conf-line :asdf-system)))
+                     ;; must be in only *update-systems*
+                     *update-systems*))
+          )
+
+      (when conf-line
+        (let (
+              (asdf-system (getf conf-line :asdf-system))
+              (type (getf conf-line :type))
+              (ref (getf conf-line :ref))
+              (url (getf conf-line :url))
+              )
+
+          ;; &&&
+          ;; should warn if updating a system with a ref, as ref will be ignored
+          (uiop:not-implemented-error 'git-update-call )
+          (read-repocicl-state)
+          )))))
 
 (defun strategy-asdf-discovery (system-name)
-  "Let ASDF's normal mechanisms (including symlinks in ~/common-lisp/) try to find the system.
+  "Let ASDF's normal mechanisms try to find the system.
    This keeps local discovery current after cloning."
   (asdf:search-for-system-definition system-name))
 
 (defun strategy-remote-discovery (system-name)
   "Final slow strategy: remote discovery + clone + link."
-  (when (or *offline-mode* (null *search-addresses*))
-    (return-from strategy-remote-discovery nil))
-  (let ((sys (string-downcase system-name)))
-    (dolist (base *search-addresses*)
-      (let ((repo-url (discover-via-remote base sys)))
-        (when repo-url
-          (let ((repo-dir (git-clone repo-url)))
-            (when repo-dir
-              (let ((asd (find-top-level-asd repo-dir sys)))
-                (when asd
-                  (format t "~&Repocicl: Discovered and linked system ~S~%" sys)
-                  (return-from strategy-remote-discovery asd))))))))
-    nil))
+
+  (dolist (git-url *search-addresses*)
+    (let ((repo-url (discover-via-remote git-url system-name)))
+      (when repo-url
+        (git-clone &&&)
+
+        ;; this can complete the conf-line
+        ;; if we find asdf-system in either clone or update list
+        ;; do search
+        ;;   set url
+        ;;   set type to git because thats the search method
+        ;;
+        )))
+
+  (read-repocicl-state)
+  ;; report sucess when newly in discovered or declared systems
+  ;; (format t "~&Repocicl: Discovered and linked system ~S~%" sys)
+
+  ;; return system-file
+  (or
+   (strategy-local-discovery system-name *declared-repocicl-systems*)
+   (strategy-local-discovery system-name *discovered-repocicl-systems*)))
 
 ;; ----------------------------------------------------------------------
 ;; Main ASDF entry point
 ;; ----------------------------------------------------------------------
 
 (defun find-asdf-system-file (system-name download-p &key (declared-p nil))
-  ;; &&& copy ocicl
-  "Find ASDF system file for SYSTEM-NAME, optionally downloading if DOWNLOAD-P is true."
+  ;; copy ocicl
+  "dispatches through stragegies to
+Find asdf system file for SYSTEM-NAME, optionally downloading if DOWNLOAD-P is true."
 
   ;; refresh state
   (initialize-globals)
@@ -439,7 +493,6 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
       (when (and download-p declared-p)
         (strategy-ensure-cloned system-name)
         (strategy-ensure-updated system-name)
-        (read-repocicl-state)
         ;; nil download-p also guards recurrence
         (find-asdf-system-file system-name nil :declared-p t))
 
@@ -448,7 +501,6 @@ subdirectory of DIRECTORY. REPOSITORY-TYPE can be :GIT, :SVN, :DARCS, or :HG"))
 
       (when download-p
         (strategy-remote-discovery system-name)
-        (read-repocicl-state)
         ;; nil download-p also guards recurrence
         (find-asdf-system-file system-name nil))
 
